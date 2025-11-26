@@ -18,8 +18,8 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as v2
 warnings.filterwarnings("ignore")
 
-from torch.quantization import quantize_dynamic
 from torchvision import models
+from torch.cuda.amp import autocast, GradScaler
 
 
 ############################################## 수정 불가 1 ##############################################
@@ -30,32 +30,139 @@ DATASET_NAME = "./dataset/test.pt"
 
 ####################################################### 수정 가능 #######################################################
 target_accuracy = 90.0  # 사용자 편의에 맞게 조정
-global_round = 10   # 사용자 편의에 맞게 조정
-batch_size = 32  # 사용자 편의에 맞게 조정
+global_round = 20   # 사용자 편의에 맞게 조정
+batch_size = 64  # 사용자 편의에 맞게 조정
 num_samples = 1280   # 사용자 편의에 맞게 조정
 host = '127.0.0.1' # loop back으로 연합학습 수행 시 사용될 ip
 port = 8081 # 1024번 ~ 65535번
 
 
 test_transform = v2.Compose([
-    v2.Resize(256, antialias=True),
-    v2.CenterCrop(IMG_SIZE),  # network에 들어갈 image shape은 꼭 192 x 192로
+    v2.Resize((IMG_SIZE, IMG_SIZE), interpolation=v2.InterpolationMode.BILINEAR),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406],
                  std=[0.229, 0.224, 0.225]),
 ])
 
+
+
+
 # Network도 사용자 편의에 맞게 조정 (client와 server의 network와 같아야 함)
+# 기존 MobileNetV2 부분을 아래와 같이 수정
+# client1.py, client2.py, server.py 모두 동일하게 수정
+
+# client1.py, client2.py, server.py 공통 수정
+class DSConv(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_ch, in_ch, 3, stride, 1, groups=in_ch, bias=False)
+        self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+    
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.bn(x)
+        return F.relu(x, inplace=True)
+
+
+class InvertedResidual(nn.Module):
+    def __init__(self, in_ch, out_ch, stride, expand_ratio):
+        super().__init__()
+        hidden_ch = in_ch * expand_ratio
+        self.use_res = stride == 1 and in_ch == out_ch
+        
+        layers = []
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv2d(in_ch, hidden_ch, 1, bias=False),
+                nn.BatchNorm2d(hidden_ch),
+                nn.ReLU(inplace=True),
+            ])
+        
+        layers.extend([
+            nn.Conv2d(hidden_ch, hidden_ch, 3, stride, 1, groups=hidden_ch, bias=False),
+            nn.BatchNorm2d(hidden_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        ])
+        
+        self.conv = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        if self.use_res:
+            return x + self.conv(x)
+        return self.conv(x)
+
+
+class OptimalMedNet(nn.Module):
+    def __init__(self, num_classes=4):
+        super().__init__()
+        
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.blocks = nn.Sequential(
+            InvertedResidual(32, 24, 1, 1),
+            InvertedResidual(24, 24, 1, 4),
+            InvertedResidual(24, 32, 2, 4),
+            InvertedResidual(32, 32, 1, 4),
+            InvertedResidual(32, 32, 1, 4),
+            InvertedResidual(32, 64, 2, 4),
+            InvertedResidual(64, 64, 1, 4),
+            InvertedResidual(64, 64, 1, 4),
+            InvertedResidual(64, 96, 2, 4),
+            InvertedResidual(96, 96, 1, 4),
+            InvertedResidual(96, 160, 2, 4),
+        )
+        
+        self.conv_last = nn.Sequential(
+            nn.Conv2d(160, 320, 1, bias=False),
+            nn.BatchNorm2d(320),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.2)
+        self.fc = nn.Linear(320, num_classes)
+        
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+    
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.conv_last(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+
 class Network1(nn.Module):
     def __init__(self, num_classes: int = NUM_CLASSES):
         super().__init__()
-        self.model = models.mobilenet_v2(weights=None, width_mult=0.5)
-        in_features = self.model.classifier[1].in_features
-        self.model.classifier[1] = nn.Linear(in_features, num_classes)
-
+        self.model = OptimalMedNet(num_classes=num_classes)
+    
     def forward(self, x):
         return self.model(x)
-
 
 
 
@@ -110,26 +217,6 @@ def measure_accuracy(global_model, test_loader):  # pruning or quantization 적�
     inference_time = inference_end - inference_start
 
     return accuracy, model, inference_time
-
-def evaluate_module(model, test_loader):
-    model.eval()
-    device = 'cpu'
-    model.to(device)
-
-    correct = 0
-    total = 0
-    start = time.time()
-    with torch.no_grad():
-        for inputs, labels in tqdm(test_loader, desc="Test (quantized)"):
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            outputs = model(inputs)
-            correct += (outputs.argmax(1) == labels).sum().item()
-            total += labels.size(0)
-    end = time.time()
-
-    acc = 100.0 * correct / total
-    return acc, end - start
 
 ##############################################################################################################################
 
@@ -230,8 +317,14 @@ def main():
     ############################ 수정 가능 ############################
     train_dataset = CustomDataset(DATASET_NAME, is_train=False, transform=test_transform)
 
-    test_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, 
-                                              shuffle=False, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(
+    train_dataset, 
+    batch_size=batch_size, 
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True,
+    persistent_workers=True
+)
 
     model = Network1().to(device)
     ####################################################################
