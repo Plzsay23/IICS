@@ -32,8 +32,8 @@ DATASET_NAME = "./dataset/client2.pt"
 
 ############################################# 수정 가능 #############################################
 local_epochs = 1         # 20 → 5 정도로 줄이고, 대신 global_round를 늘리는 쪽이 FL에 더 맞음
-lr = 0.0007              # 0.0001 → 0.001 (Adam 기준)
-batch_size = 64          # 서버와 맞추기
+lr = 0.001              # 0.0001 → 0.001 (Adam 기준)
+batch_size = 32          # 서버와 맞추기
 host_ip = "127.0.0.1"
 port = 8081
 
@@ -268,7 +268,7 @@ def main():
     model = Network1().to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
 
 ##############################################################################################################################
