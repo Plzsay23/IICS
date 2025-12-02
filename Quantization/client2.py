@@ -15,11 +15,10 @@ import select
 import os
 from torchvision import models
 import torchvision.transforms.v2 as v2
+from torch.optim.lr_scheduler import StepLR
+from torchvision import models
+from torch.cuda.amp import autocast, GradScaler
 
-########
-import torch.nn.utils.prune as prune
-# [추가] 경량화 수치 출력을 위해 io 필요
-import io
 
 warnings.filterwarnings("ignore")
 
@@ -32,141 +31,218 @@ DATASET_NAME = "./dataset/client2.pt"
 
 
 ############################################# 수정 가능 #############################################
-local_epochs = 5
-lr = 0.001
-batch_size = 32
+#######
+local_epochs = 3         # (변경) 1 -> 3
+#######
+lr = 0.0008              
+batch_size = 32          
 host_ip = "127.0.0.1"
 port = 8081
 
+WIDTH_MULT = 0.35
 
 ################# 전처리 코드 수정 가능하나 꼭 IMG_SIZE로 resize한 뒤 정규화 해야 함 #################
-# [수정] 전처리를 client1과 동일하게 맞춰주기 (일반화 향상)
 train_transform = v2.Compose([
-    v2.Resize(224, antialias=True),                                  # [추가]
-    v2.RandomResizedCrop(IMG_SIZE, scale=(0.7, 1.0), antialias=True),
-    v2.RandomHorizontalFlip(p=0.5),                                  # [추가]
-    v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),    # [추가]
-    v2.RandomRotation(degrees=7),
-    v2.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+    v2.Resize((IMG_SIZE, IMG_SIZE), interpolation=v2.InterpolationMode.BILINEAR),
+    v2.RandomHorizontalFlip(p=0.5),
+    #######
+    v2.RandomRotation(degrees=2),  # (완화)
+    # v2.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.02),  # 임시 비활성
+    # v2.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),  # 임시 비활성
+    # v2.RandomErasing(p=0.1, scale=(0.02, 0.1), ratio=(0.3, 3.3)),  # 임시 비활성
+    #######
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406],
-                 std=[0.229, 0.224, 0.225]),
+                 std=[0.229, 0.224, 0.225])
 ])
 
 
-## 아래는 예시 모델이며, 예시 모델 그대로 사용하여 제출하면 안됨
-class Network1(nn.Module):
-    def __init__(self, num_classes: int = NUM_CLASSES):
+
+
+
+
+class DSConv(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 12, 5, 1, 1)
-        self.bn1   = nn.BatchNorm2d(12)
-        self.conv2 = nn.Conv2d(12, 12, 5, 1, 1)
-        self.bn2   = nn.BatchNorm2d(12)
-        self.pool  = nn.MaxPool2d(2,2)
-        self.conv4 = nn.Conv2d(12, 24, 5, 1, 1)
-        self.bn4   = nn.BatchNorm2d(24)
-        self.conv5 = nn.Conv2d(24, 24, 5, 1, 1)
-        self.bn5   = nn.BatchNorm2d(24)
-        self.apool = nn.AdaptiveAvgPool2d((10,10))
-        self.fc1   = nn.Linear(24*10*10, num_classes)
+        self.depthwise = nn.Conv2d(in_ch, in_ch, 3, stride, 1, groups=in_ch, bias=False)
+        self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+    
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.bn(x)
+        return F.relu(x, inplace=True)
+
+
+class InvertedResidual(nn.Module):
+    def __init__(self, in_ch, out_ch, stride, expand_ratio):
+        super().__init__()
+        hidden_ch = in_ch * expand_ratio
+        self.use_res = stride == 1 and in_ch == out_ch
+        
+        layers = []
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv2d(in_ch, hidden_ch, 1, bias=False),
+                nn.BatchNorm2d(hidden_ch),
+                nn.ReLU(inplace=True),
+            ])
+        
+        layers.extend([
+            nn.Conv2d(hidden_ch, hidden_ch, 3, stride, 1, groups=hidden_ch, bias=False),
+            nn.BatchNorm2d(hidden_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        ])
+        
+        self.conv = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        if self.use_res:
+            return x + self.conv(x)
+        return self.conv(x)
+
+
+class OptimalMedNet(nn.Module):
+    def __init__(self, num_classes=4, width_mult=WIDTH_MULT):
+        super().__init__()
+
+        def c(v):
+            return max(8, int(v * width_mult))
+
+        stem_out = c(32)
+        c24 = c(24)
+        c32 = c(32)
+        c64 = c(64)
+        c96 = c(96)
+        c160 = c(160)
+        c320 = c(320)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, stem_out, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(stem_out),
+            nn.ReLU(inplace=True),
+        )
+
+        self.blocks = nn.Sequential(
+            InvertedResidual(stem_out, c24, 1, 1),
+            InvertedResidual(c24, c24, 1, 4),
+            InvertedResidual(c24, c32, 2, 4),
+            InvertedResidual(c32, c32, 1, 4),
+            InvertedResidual(c32, c32, 1, 4),
+            InvertedResidual(c32, c64, 2, 4),
+            InvertedResidual(c64, c64, 1, 4),
+            InvertedResidual(c64, c64, 1, 4),
+            InvertedResidual(c64, c96, 2, 4),
+            InvertedResidual(c96, c96, 1, 4),
+            InvertedResidual(c96, c160, 2, 4),
+        )
+
+        self.conv_last = nn.Sequential(
+            nn.Conv2d(c160, c320, 1, bias=False),
+            nn.BatchNorm2d(c320),
+            nn.ReLU(inplace=True),
+        )
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.2)
+        self.fc = nn.Linear(c320, num_classes)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.pool(x)
-        x = F.relu(self.bn4(self.conv4(x)))
-        x = F.relu(self.bn5(self.conv5(x)))
-        x = self.apool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc1(x)
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.conv_last(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.fc(x)
         return x
 
 
-##################    
-def apply_pruning(model, amount: float = 0.3):
+class Network1(nn.Module):
+    def __init__(self, num_classes: int = NUM_CLASSES):
+        super().__init__()
+        self.model = OptimalMedNet(num_classes=num_classes, width_mult=WIDTH_MULT)
+    
+    def forward(self, x):
+        return self.model(x)
+
+
+
+
+def train(model, criterion, optimizer, train_loader):
     """
-    amount: 0.3 => 가중치의 30%를 L1 기준으로 0으로 만듦(언스트럭처드 프루닝)
+    AMP(Automatic Mixed Precision)를 적용하여
+    학습 속도를 높이고 메모리를 절약하는 전체 학습 함수
     """
-    for m in model.modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            prune.l1_unstructured(m, name="weight", amount=amount)
-            prune.remove(m, "weight")
-    return model
-
-
-# [추가] 파라미터 수
-def count_params(model):
-    return sum(p.numel() for p in model.parameters())
-
-# [추가] 모델 사이즈 (바이트)
-def sizeof_state_dict_bytes(model):
-    buf = io.BytesIO()
-    torch.save(model.state_dict(), buf)
-    return buf.getbuffer().nbytes
-
-# [추가] 가중치 희소도(0 비율)
-def calc_weight_sparsity(model):
-    zeros = 0
-    total = 0
-    for m in model.modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            w = m.weight.detach()
-            zeros += (w == 0).sum().item()
-            total += w.numel()
-    return zeros / total if total > 0 else 0
-
-
-def train(model, criterion, optimizer, train_loader):   # pruning or quantization 적용시 필요한 경우 수정
-
-    best_accuracy = 0.0
     model.to(device)
+    model.train()
+    scaler = GradScaler()
 
     for epoch in range(local_epochs):
         running_corrects = 0
         running_loss = 0.0
         total = 0
 
-        for (images, labels) in tqdm(train_loader, desc="Train"):
-            images = images.to(device)
-            labels = labels.to(device)
+        # Tqdm으로 진행률 표시
+        with tqdm(train_loader, desc=f"Epoch {epoch + 1}/{local_epochs}", unit="batch") as pbar:
+            for images, labels in pbar:
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
 
-            running_loss += loss.item()
+                # Autocast
+                with autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
 
-            _, preds = torch.max(outputs, 1)
-            running_corrects += torch.sum(preds == labels.data)
-            total += labels.size(0)
+                # Scaler: 손실 스케일링 후 역전파
+                #######
+                # (변경) 안정성 위해 gradient clipping 추가
+                #######
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                
+                # 정확도 및 손실 계산 (로깅용)
+                running_loss += loss.item() * images.size(0)
+                _, preds = torch.max(outputs, 1)
+                correct_counts = torch.sum(preds == labels).item()
+                running_corrects += correct_counts
+                total += labels.size(0)
 
-        epoch_loss = running_loss / len(train_loader)
-        epoch_accuracy = running_corrects.double() / total
+                current_loss = loss.item()
+                pbar.set_postfix({'loss': f'{current_loss:.4f}'})
 
-        print(f"Epoch [{epoch + 1}/{local_epochs}] => Train Loss: {epoch_loss:.4f} | Train Accuracy: {epoch_accuracy * 100:.2f}%")
-
-    # -------------------------------
-    # [추가] 프루닝 전 경량화 지표
-    # -------------------------------
-    print("\n[경량화] Pruning 적용 전 지표")
-    print(f" - Param count          : {count_params(model):,}")
-    print(f" - State_dict size(bytes): {sizeof_state_dict_bytes(model):,}")
-    print(f" - Weight sparsity(%)    : {calc_weight_sparsity(model)*100:.2f}")
-
-    # 실제 pruning 적용
-    model = apply_pruning(model, amount=0.3)
-
-    # -------------------------------
-    # [추가] 프루닝 후 경량화 지표
-    # -------------------------------
-    print("\n[경량화] Pruning 적용 후 지표")
-    print(f" - Param count          : {count_params(model):,}")
-    print(f" - State_dict size(bytes): {sizeof_state_dict_bytes(model):,}")
-    print(f" - Weight sparsity(%)    : {calc_weight_sparsity(model)*100:.2f}")
+        # 에포크 종료 후 전체 통계 출력
+        epoch_loss = running_loss / total
+        epoch_accuracy = running_corrects / total * 100.0
+        print(f"Epoch [{epoch + 1}/{local_epochs}] => Train Loss: {epoch_loss:.4f} | Train Accuracy: {epoch_accuracy:.2f}%")
 
     return model
+
+
+
 
 
 ##############################################################################################################################
@@ -190,26 +266,34 @@ class CustomDataset(Dataset):
         rec = self.items[idx]
         x = rec["tensor"].float() / 255.0      # uint8 [C,H,W]
         y = int(rec["label"])
-        x = self.transform(x)
-        return x, y
 
+        x = self.transform(x)
+
+        return x, y
 
 def main():
 
     train_dataset = CustomDataset(DATASET_NAME, is_train=True, transform=train_transform)
-    num_workers = max(2, (os.cpu_count() or 8) - 2)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                                               num_workers=num_workers, pin_memory=True,
-                                               prefetch_factor=4, persistent_workers=True)
+    train_loader = torch.utils.data.DataLoader(
+    train_dataset, 
+    batch_size=batch_size, 
+    shuffle=True,          
+    num_workers=2,         
+    pin_memory=True,       
+    persistent_workers=True
+)
 
     model = Network1().to(device)
 
-    optimizer = optim.SGD(model.parameters(), lr=lr)
-    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    #######
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.02)  # (완화)
+    #######
 
 
 ##############################################################################################################################
+
 
 
 
@@ -226,7 +310,6 @@ def main():
         while remaining_payload != 0:
             rec_payload += client.recv(remaining_payload)
             remaining_payload = data_size - len(rec_payload)
-
         dict_weight = pickle.loads(rec_payload)
         weight = OrderedDict(dict_weight)
         print("\nReceived updated global model from server")
