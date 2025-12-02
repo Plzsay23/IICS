@@ -18,6 +18,10 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as v2
 warnings.filterwarnings("ignore")
 
+from torchvision import models
+from torch.cuda.amp import autocast, GradScaler
+
+
 ############################################## 수정 불가 1 ##############################################
 IMG_SIZE = 192
 NUM_CLASSES = 4
@@ -25,49 +29,155 @@ DATASET_NAME = "./dataset/test.pt"
 ######################################################################################################
 
 ####################################################### 수정 가능 #######################################################
-target_accuracy = 90.0  # 사용자 편의에 맞게 조정
-global_round = 20   # 사용자 편의에 맞게 조정
+target_accuracy = 95.0  # 사용자 편의에 맞게 조정
+global_round = 30   # 사용자 편의에 맞게 조정
 batch_size = 32  # 사용자 편의에 맞게 조정
 num_samples = 1280   # 사용자 편의에 맞게 조정
 host = '127.0.0.1' # loop back으로 연합학습 수행 시 사용될 ip
 port = 8081 # 1024번 ~ 65535번
 
+WIDTH_MULT = 0.35
 
 test_transform = v2.Compose([
-    v2.Resize(256, antialias=True),
-    v2.CenterCrop(IMG_SIZE),  # network에 들어갈 image shape은 꼭 192 x 192로
+    v2.Resize((IMG_SIZE, IMG_SIZE), interpolation=v2.InterpolationMode.BILINEAR),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize(mean=[0.485, 0.456, 0.406],
                  std=[0.229, 0.224, 0.225]),
 ])
 
+
+
+
 # Network도 사용자 편의에 맞게 조정 (client와 server의 network와 같아야 함)
+# 기존 MobileNetV2 부분을 아래와 같이 수정
+# client1.py, client2.py, server.py 모두 동일하게 수정
+
+# client1.py, client2.py, server.py 공통 수정
+class DSConv(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_ch, in_ch, 3, stride, 1, groups=in_ch, bias=False)
+        self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+    
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.bn(x)
+        return F.relu(x, inplace=True)
+
+
+class InvertedResidual(nn.Module):
+    def __init__(self, in_ch, out_ch, stride, expand_ratio):
+        super().__init__()
+        hidden_ch = in_ch * expand_ratio
+        self.use_res = stride == 1 and in_ch == out_ch
+        
+        layers = []
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv2d(in_ch, hidden_ch, 1, bias=False),
+                nn.BatchNorm2d(hidden_ch),
+                nn.ReLU(inplace=True),
+            ])
+        
+        layers.extend([
+            nn.Conv2d(hidden_ch, hidden_ch, 3, stride, 1, groups=hidden_ch, bias=False),
+            nn.BatchNorm2d(hidden_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        ])
+        
+        self.conv = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        if self.use_res:
+            return x + self.conv(x)
+        return self.conv(x)
+
+
+class OptimalMedNet(nn.Module):
+    def __init__(self, num_classes=4, width_mult=WIDTH_MULT):
+        super().__init__()
+
+        def c(v):
+            return max(8, int(v * width_mult))
+
+        stem_out = c(32)
+        c24 = c(24)
+        c32 = c(32)
+        c64 = c(64)
+        c96 = c(96)
+        c160 = c(160)
+        c320 = c(320)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, stem_out, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(stem_out),
+            nn.ReLU(inplace=True),
+        )
+
+        self.blocks = nn.Sequential(
+            InvertedResidual(stem_out, c24, 1, 1),
+            InvertedResidual(c24, c24, 1, 4),
+            InvertedResidual(c24, c32, 2, 4),
+            InvertedResidual(c32, c32, 1, 4),
+            InvertedResidual(c32, c32, 1, 4),
+            InvertedResidual(c32, c64, 2, 4),
+            InvertedResidual(c64, c64, 1, 4),
+            InvertedResidual(c64, c64, 1, 4),
+            InvertedResidual(c64, c96, 2, 4),
+            InvertedResidual(c96, c96, 1, 4),
+            InvertedResidual(c96, c160, 2, 4),
+        )
+
+        self.conv_last = nn.Sequential(
+            nn.Conv2d(c160, c320, 1, bias=False),
+            nn.BatchNorm2d(c320),
+            nn.ReLU(inplace=True),
+        )
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.2)
+        self.fc = nn.Linear(c320, num_classes)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.conv_last(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+
 class Network1(nn.Module):
     def __init__(self, num_classes: int = NUM_CLASSES):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 12, 5, 1, 1)
-        self.bn1 = nn.BatchNorm2d(12)
-        self.conv2 = nn.Conv2d(12, 12, 5, 1, 1)
-        self.bn2 = nn.BatchNorm2d(12)
-        self.pool = nn.MaxPool2d(2,2)
-        self.conv4 = nn.Conv2d(12, 24, 5, 1, 1)
-        self.bn4 = nn.BatchNorm2d(24)
-        self.conv5 = nn.Conv2d(24, 24, 5, 1, 1)
-        self.bn5 = nn.BatchNorm2d(24)
-
-        self.avgpool = nn.AdaptiveAvgPool2d((10,10))
-        self.fc1 = nn.Linear(24*10*10, num_classes)
-
+        self.model = OptimalMedNet(num_classes=num_classes, width_mult=WIDTH_MULT)
+    
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.pool(x)
-        x = F.relu(self.bn4(self.conv4(x)))
-        x = F.relu(self.bn5(self.conv5(x)))
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc1(x)
-        return x
+        return self.model(x)
+
+
+
 
 class CustomDataset(Dataset):
     def __init__(self, pt_path: str, is_train: bool = False, transform=None):
@@ -89,9 +199,9 @@ class CustomDataset(Dataset):
 
         return x, y
 
-
-#내가 해야할 부분 , 경량화 및 양자화
 def measure_accuracy(global_model, test_loader):  # pruning or quantization 적용시 필요한 경우 수정
+
+    print("[Server] Using FP32 evaluation (no quantization).")
 
     model = Network1().to(device)
     # model = Network2().to(device)
@@ -122,6 +232,7 @@ def measure_accuracy(global_model, test_loader):  # pruning or quantization 적�
     inference_time = inference_end - inference_start
 
     return accuracy, model, inference_time
+
 ##############################################################################################################################
 
 
@@ -140,6 +251,22 @@ global_accuracy = 0.0
 current_round = 0
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+######추가됨######
+# 안전하게 정확히 N바이트를 수신하는 함수 (EOF 시 None 반환)
+def recv_exactly(conn: socket.socket, n: int) -> bytes | None:
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = conn.recv(n - len(buf))
+        except ConnectionResetError:
+            return None
+        if not chunk:  # EOF
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+######추가됨######
+
+
 def handle_client(conn, addr, model, test_loader):
     global model_list, global_model, global_accuracy, global_model_size, current_round, cnt
     print(f"Connected by {addr}")
@@ -148,20 +275,46 @@ def handle_client(conn, addr, model, test_loader):
         if len(cnt) < 2:
             cnt.append(1)
             weight = pickle.dumps(dict(model.state_dict().items()))
-            # print(weight)
             conn.send(struct.pack('>I', len(weight)))
             conn.send(weight)
 
-        data_size = struct.unpack('>I', conn.recv(4))[0]
-        received_payload = b""
-        remaining_payload_size = data_size
-        while remaining_payload_size != 0:
-            received_payload += conn.recv(remaining_payload_size)
-            remaining_payload_size = data_size - len(received_payload)
-        model = pickle.loads(received_payload)
+        ######추가됨######
+        # 기존: data_size = struct.unpack('>I', conn.recv(4))[0]
+        # TCP 분할/EOF에 안전하도록 정확히 4바이트 읽기
+        header = recv_exactly(conn, 4)
+        if header is None:
+            print(f"[Server] {addr}에서 연결 종료(헤더 수신 실패). 스레드 종료.")
+            conn.close()
+            return
+        data_size = struct.unpack('>I', header)[0]
+        ######추가됨######
+
+        # 기존 구현은 recv를 한 번에 남은 바이트만큼 요청하지만, EOF 보호가 약함
+        # 안전한 수신으로 대체
+        # received_payload = b""
+        # remaining_payload_size = data_size
+        # while remaining_payload_size != 0:
+        #     received_payload += conn.recv(remaining_payload_size)
+        #     remaining_payload_size = data_size - len(received_payload)
+
+        ######추가됨######
+        payload = recv_exactly(conn, data_size)
+        if payload is None:
+            print(f"[Server] {addr}에서 연결 종료(페이로드 수신 실패). 스레드 종료.")
+            conn.close()
+            return
+        received_payload = payload
+        ######추가됨######
+
+        try:
+            model = pickle.loads(received_payload)
+        except Exception as e:
+            print(f"[Server] 수신 모델 디시리얼라이즈 실패: {e}. 스레드 종료.")
+            conn.close()
+            return
 
         model_list.append(model)
-        # print(models)
+
         if len(model_list) == 2:
             current_round += 1
             global_model = average_models(model_list)
@@ -173,21 +326,29 @@ def handle_client(conn, addr, model, test_loader):
         else:
             semaphore.acquire()
 
+        # 종료 조건
         if (current_round == global_round) or (global_accuracy >= target_accuracy):
             weight = pickle.dumps(dict(global_model.state_dict().items()))
-            conn.send(struct.pack('>I', len(weight)))
-            conn.send(weight)
+            try:
+                conn.send(struct.pack('>I', len(weight)))
+                conn.send(weight)
+            except Exception:
+                pass
             conn.close()
             break
         else:
             weight = pickle.dumps(dict(global_model.state_dict().items()))
-            conn.send(struct.pack('>I', len(weight)))
-            conn.send(weight)
+            try:
+                conn.send(struct.pack('>I', len(weight)))
+                conn.send(weight)
+            except Exception:
+                print(f"[Server] {addr}로 전송 실패(연결 종료 가능). 스레드 종료.")
+                conn.close()
+                break
 
 def get_model_size(global_model):
     model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
     model_size = model_size / (1024 ** 2)
-
     return model_size
 
 
@@ -220,11 +381,15 @@ def main():
 
     ############################ 수정 가능 ############################
     train_dataset = CustomDataset(DATASET_NAME, is_train=False, transform=test_transform)
-    num_workers = max(2, (os.cpu_count() or 8) - 2)
 
-    test_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=False,
-                                               num_workers=num_workers, pin_memory=True,
-                                               prefetch_factor=4, persistent_workers=True)
+    test_loader = torch.utils.data.DataLoader(
+    train_dataset, 
+    batch_size=batch_size, 
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True,
+    persistent_workers=True
+)
 
     model = Network1().to(device)
     ####################################################################
@@ -248,24 +413,37 @@ def main():
     total_time = training_end - training_start
 
     # 평가지표 1
-    print(f"\n학습 성능 : {global_accuracy} %")
+    ######추가됨######
+    # global_model이 하나도 안만들어진 비정상 종료 보호
+    if global_model is None:
+        print("\n학습 성능 : 0.0 %")
+    else:
+        print(f"\n학습 성능 : {global_accuracy} %")
+    ######추가됨######
+
     # 평가지표 2
     print(f"\n학습 소요 시간: {int(total_time // 3600)} 시간 {int((total_time % 3600) // 60)} 분 {(total_time % 60):.2f} 초")
 
     # 평가지표 3
-    print(f"\n최종 모델 크기: {global_model_size:.4f} MB")
+    ######추가됨######
+    if global_model is None:
+        print(f"\n최종 모델 크기: 0.0000 MB")
+    else:
+        print(f"\n최종 모델 크기: {get_model_size(global_model):.4f} MB")
+    ######추가됨######
 
-    final_model = dict(global_model.state_dict().items())
-    _, _, inference_time = measure_accuracy(final_model, test_loader)
-    # 평가지표 4
-    print(f"\n예측 소요 시간 : {(inference_time):.2f} 초")
+    ######추가됨######
+    # 최종 평가도 global_model이 있을 때만 수행
+    if global_model is not None:
+        final_model = dict(global_model.state_dict().items())
+        _, _, inference_time = measure_accuracy(final_model, test_loader)
+        print(f"\n예측 소요 시간 : {(inference_time):.2f} 초")
+    ######추가됨######
 
     print("연합학습 종료")
 
 
 if __name__ == "__main__":
-
-
 
     main()
 ##############################################################################################################################
